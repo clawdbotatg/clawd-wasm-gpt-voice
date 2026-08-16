@@ -167,6 +167,7 @@ class Handler(BaseHTTPRequestHandler):
         "/index.html": ("index.html", "text/html; charset=utf-8"),
         "/spike.html": ("spike.html", "text/html; charset=utf-8"),
         "/aec/aec-worklet.js": ("aec/aec-worklet.js", "text/javascript"),
+        "/aec/aec-align.js": ("aec/aec-align.js", "text/javascript"),
         "/aec/aec.wasm": ("aec/aec.wasm", "application/wasm"),
     }
 

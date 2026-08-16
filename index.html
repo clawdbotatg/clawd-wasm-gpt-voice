@@ -114,6 +114,7 @@ Pause mid-thought — semantic VAD waits. Interrupt it — it stops. Ask for a c
   </div>
 </div>
 
+<script src="/aec/aec-align.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const btn = $('btn'), applyBtn = $('applyBtn'), statusEl = $('status'), logEl = $('log');
@@ -209,16 +210,20 @@ async function buildAecPath() {
     fetch('/aec/aec.wasm').then(r => r.arrayBuffer()),
     ctx.audioWorklet.addModule('/aec/aec-worklet.js'),
   ]);
+  // AGC off: the iPhone spike matrix showed mic auto-gain riding the volume
+  // destabilizes the adaptive filter (2026-08-16); NS stays on.
   mic = await navigator.mediaDevices.getUserMedia({ audio: {
-    echoCancellation: false, noiseSuppression: true, autoGainControl: true } });
+    echoCancellation: false, noiseSuppression: true, autoGainControl: false } });
   const node = new AudioWorkletNode(ctx, 'aec-processor', {
     numberOfInputs: 2, numberOfOutputs: 1, outputChannelCount: [1],
     processorOptions: { wasmBytes, tailMs: 200 } });
   node.port.onmessage = e => {
     const d = e.data;
+    if (window.AecAlign && AecAlign.handle(node, d)) return; // delay tracker
     if (d.type === 'stats') {
       aecLine.textContent = 'AEC: ' + (d.ready ? 'on' : 'loading') +
-        (d.erleDb != null ? ' · cancelling ' + d.erleDb.toFixed(0) + ' dB' : ' · idle');
+        (d.erleDb != null ? ' · cancelling ' + d.erleDb.toFixed(0) + ' dB' : ' · idle') +
+        (d.farDelayMs ? ' · delay ' + d.farDelayMs + ' ms' : '');
     }
     if (d.type === 'error') { aecLine.textContent = 'AEC: FAILED — ' + d.error; log('e', 'aec worklet error: ' + d.error); }
   };

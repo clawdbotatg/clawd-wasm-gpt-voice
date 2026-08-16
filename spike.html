@@ -60,6 +60,7 @@
   <div class="res" id="rep">results auto-POST to /report on this server</div>
 </div>
 
+<script src="/aec/aec-align.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const UA = navigator.userAgent;
@@ -94,20 +95,28 @@ $('t0').onclick = async () => {
     const node = new AudioWorkletNode(ctx, 'aec-processor', {
       numberOfInputs: 2, numberOfOutputs: 1, outputChannelCount: [1],
       processorOptions: { wasmBytes, tailMs: 200 } });
-    const stats = [];
+    const stats = []; const delays = [];
+    node.onprocessorerror = ev => { lines.push('FAIL — worklet processor crashed'); show(r0, lines); };
     node.port.onmessage = e => {
       const d = e.data;
+      if (AecAlign.handle(node, d)) return;
       if (d.type === 'stats' && d.erleDb != null) {
-        stats.push(d.erleDb);
-        lines[0] = `RUNNING — ${stats.length}s  ERLE now: ${d.erleDb.toFixed(1)} dB`;
+        stats.push(d.erleDb); delays.push(d.farDelayMs || 0);
+        lines[0] = `RUNNING — ${stats.length}s  ERLE now: ${d.erleDb.toFixed(1)} dB  tracked delay: ${d.farDelayMs} ms`;
         show(r0, lines);
       }
       if (d.type === 'error') { lines.push('worklet FAIL: ' + d.error); show(r0, lines); }
     };
     const clip = await voiceClip(ctx);
     const src = ctx.createBufferSource(); src.buffer = clip; src.loop = true;
-    // simulated room: 50ms delay, -6dB
+    // simulated room: 50ms delay -6dB, then what iOS actually does — a
+    // DISCRETE JUMP (route/pipeline change) to 120ms at 6s, plus mild
+    // 0.5ms/s clock drift after. The 50ms start must be handled by the
+    // filter alone (tracker deadband), the jump by the delay tracker.
     const delay = ctx.createDelay(1); delay.delayTime.value = 0.05;
+    delay.delayTime.setValueAtTime(0.12, ctx.currentTime + 6);
+    delay.delayTime.setValueAtTime(0.12, ctx.currentTime + 7);
+    delay.delayTime.linearRampToValueAtTime(0.124, ctx.currentTime + 15);
     const echoGain = ctx.createGain(); echoGain.gain.value = 0.5;
     src.connect(delay).connect(echoGain).connect(node, 0, 0);  // "mic" = echo only
     src.connect(node, 0, 1);                                   // reference
@@ -121,10 +130,11 @@ $('t0').onclick = async () => {
     const verdict = settled != null && settled >= 15 ? 'PASS' : 'FAIL';
     lines[0] = 'done';
     lines.push(`ERLE per second: ${stats.map(s => s.toFixed(0)).join(' ')}`);
+    lines.push(`tracked delay/s: ${delays.map(s => s.toFixed(0)).join(' ')} (true: 50ms, jump to 120ms @6s, +0.5ms/s)`);
     lines.push(`settled (last 5s avg): ${settled == null ? 'n/a' : settled.toFixed(1) + ' dB'}`);
     lines.push(`TEST 0: ${verdict} (threshold 15 dB)`);
     show(r0, lines);
-    await report('synthetic-pipeline', { erlePerSec: stats, settledDb: settled, verdict, sampleRate: ctx.sampleRate });
+    await report('synthetic-pipeline', { erlePerSec: stats, delaysPerSec: delays, settledDb: settled, verdict, sampleRate: ctx.sampleRate });
   } catch (e) {
     lines.push('FAIL — ' + e); show(r0, lines);
     await report('synthetic-pipeline', { error: String(e), verdict: 'FAIL' });
@@ -245,11 +255,12 @@ async function runVariant(ctx, wasmBytes, clip, v, onTick) {
   const node = new AudioWorkletNode(ctx, 'aec-processor', {
     numberOfInputs: 2, numberOfOutputs: 1, outputChannelCount: [1],
     processorOptions: { wasmBytes, tailMs: v.tailMs } });
-  const stats = [];
+  const stats = []; const delays = [];
   let err = null;
   node.port.onmessage = e => {
     const d = e.data;
-    if (d.type === 'stats' && d.erleDb != null) { stats.push(d.erleDb); onTick(stats); }
+    if (AecAlign.handle(node, d)) return;
+    if (d.type === 'stats' && d.erleDb != null) { stats.push(d.erleDb); delays.push(d.farDelayMs || 0); onTick(stats); }
     if (d.type === 'error') err = d.error;
   };
   const micSrc = ctx.createMediaStreamSource(mic);
@@ -272,7 +283,7 @@ async function runVariant(ctx, wasmBytes, clip, v, onTick) {
   const tail = stats.slice(-7);
   const settled = tail.length ? tail.reduce((a, b) => a + b, 0) / tail.length : null;
   return { key: v.key, tailMs: v.tailMs, agc: v.agc, erlePerSec: stats.map(s => +s.toFixed(1)),
-    settledDb: settled, peakDb: stats.length ? Math.max(...stats) : null,
+    delaysPerSec: delays, settledDb: settled, peakDb: stats.length ? Math.max(...stats) : null,
     error: err, micSettings };
 }
 

@@ -34,10 +34,31 @@ class AecProcessor extends AudioWorkletProcessor {
     // metrics (energies while far end is active)
     this.mNear = 0; this.mOut = 0; this.mFar = 0; this.mFrames = 0; this.lastPost = 0;
 
+    // delay tracking: 1kHz amplitude envelopes of the PAIRED near/far frames,
+    // posted to the main thread (aec-align.js) which cross-correlates and
+    // commands farDelay shifts. farDelay = extra samples of delay applied to
+    // the far reference so it coincides with the echo in the mic signal.
+    this.ENVD = 48;                       // 48 samples/env point = 1kHz
+    this.ENVLEN = 1400;                   // 1.4s of envelope history
+    this.envN = new Float32Array(this.ENVLEN);
+    this.envF = new Float32Array(this.ENVLEN);
+    this.envW = 0; this.envSincePost = 0;
+    this.farDelay = 0;                    // samples
+    this.MAXDELAY = Math.floor(sampleRate * 0.7);
+
     this.port.onmessage = (e) => {
       const d = e.data || {};
       if (d.type === 'reset' && this.ready) this.E.aec_reset();
       if (d.type === 'bypass') this.bypass = !!d.on;
+      if (d.type === 'farDelay') {        // residual lag measured on the paired envelopes
+        const delta = Math.round((d.ms || 0) * sampleRate / 1000);
+        const target = Math.min(this.MAXDELAY, Math.max(0, this.farDelay + delta));
+        if (Math.abs(target - this.farDelay) >= sampleRate * 0.003) {
+          this.farDelay = target;
+          // big realignment invalidates the learned response — converge fresh
+          if (this.ready) this.E.aec_reset();
+        }
+      }
     };
 
     if (po.wasmBytes) this._instantiate(po.wasmBytes);
@@ -100,12 +121,32 @@ class AecProcessor extends AudioWorkletProcessor {
       while (this.nearW - this.nearR >= F) {
         for (let i = 0; i < F; i++) {
           const n = this.nearQ[(this.nearR + i) % this.nearQ.length];
-          const f = (this.farR + i < this.farW) ? this.farQ[(this.farR + i) % this.farQ.length] : 0;
+          const fi = this.farR + i - this.farDelay; // delayed reference
+          const f = (fi >= 0 && fi < this.farW) ? this.farQ[fi % this.farQ.length] : 0;
           h[this.nearPtr + i] = Math.max(-32768, Math.min(32767, (n * 32767) | 0));
           h[this.farPtr + i] = Math.max(-32768, Math.min(32767, (f * 32767) | 0));
         }
         this.nearR += F;
         this.farR += F; // lockstep with nearR by construction
+        // paired-envelope accumulation for the delay tracker
+        for (let b = 0; b + this.ENVD <= F; b += this.ENVD) {
+          let an = 0, af = 0;
+          for (let i = b; i < b + this.ENVD; i++) {
+            an += Math.abs(h[this.nearPtr + i]); af += Math.abs(h[this.farPtr + i]);
+          }
+          this.envN[this.envW % this.ENVLEN] = an / (this.ENVD * 32768);
+          this.envF[this.envW % this.ENVLEN] = af / (this.ENVD * 32768);
+          this.envW++; this.envSincePost++;
+        }
+        if (this.envSincePost >= 3000 && this.envW >= this.ENVLEN) { // every 3s, once warm
+          this.envSincePost = 0;
+          const nOut = new Float32Array(this.ENVLEN), fOut = new Float32Array(this.ENVLEN);
+          for (let t = 0; t < this.ENVLEN; t++) {
+            const src = (this.envW - this.ENVLEN + t) % this.ENVLEN;
+            nOut[t] = this.envN[src]; fOut[t] = this.envF[src];
+          }
+          this.port.postMessage({ type: 'env', near: nOut, far: fOut }, [nOut.buffer, fOut.buffer]);
+        }
         this.E.aec_process();
         let en = 0, eo = 0, ef = 0;
         for (let i = 0; i < F; i++) {
@@ -138,6 +179,7 @@ class AecProcessor extends AudioWorkletProcessor {
         type: 'stats', ready: this.ready, erleDb: erle,
         farActiveFrames: this.mFrames,
         farRms: Math.sqrt(this.mFar / Math.max(1, this.frame * this.mFrames)) | 0,
+        farDelayMs: +(this.farDelay * 1000 / sampleRate).toFixed(1),
       });
       this.mNear = 0; this.mOut = 0; this.mFar = 0; this.mFrames = 0;
     }
