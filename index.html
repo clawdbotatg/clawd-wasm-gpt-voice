@@ -227,8 +227,15 @@ async function buildAecPath() {
       aecLine.textContent = 'AEC: ' + (d.ready ? 'on' : 'loading') +
         (d.erleDb != null ? ' · cancelling ' + d.erleDb.toFixed(0) + ' dB' : ' · idle') +
         (d.farDelayMs ? ' · delay ' + d.farDelayMs + ' ms' : '');
+      // assistant audibly speaking but reference silent -> tap strategy is
+      // dead on this browser; escalate (and finally fall back to raw playback)
+      if (aec && aec.retap && d.ready && !d.farRms && Date.now() - lastResponseAt < 8000 &&
+          Date.now() - (aec.lastRetapAt || 0) > 4000) {
+        aec.lastRetapAt = Date.now();
+        if (!aec.retap()) { aec.tapDead && aec.tapDead(); aec.tapDead = null; }
+      }
       telemetry.push({ t: Math.round(Date.now() / 1000), erle: d.erleDb == null ? null : +d.erleDb.toFixed(1),
-        delay: d.farDelayMs, farRms: d.farRms, farActive: d.farActiveFrames });
+        delay: d.farDelayMs, farRms: d.farRms, farActive: d.farActiveFrames, tap: aec ? aec.tapStrategy : -1 });
       if (Date.now() - lastTelemetrySend > 10000) {
         lastTelemetrySend = Date.now();
         fetch('/report', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -241,10 +248,50 @@ async function buildAecPath() {
   ctx.createMediaStreamSource(mic).connect(node, 0, 0);
   const cleanDest = ctx.createMediaStreamDestination();
   node.connect(cleanDest);
+  const spkDest = ctx.createMediaStreamDestination(); // what the user hears (fed by the tap)
   aecLine.style.display = 'block';
   aecLine.textContent = 'AEC: on';
-  return { ctx, node, cleanTrack: cleanDest.stream.getAudioTracks()[0] };
+  return { ctx, node, spkDest, cleanTrack: cleanDest.stream.getAudioTracks()[0] };
 }
+
+// Reference-tap strategies for the remote track. On iOS Safari the obvious
+// tap (createMediaStreamSource on the remote stream) can yield pure silence
+// for a REAL network track even though an in-page loopback track taps fine
+// (measured 2026-08-16: demo farRms pinned at 0 while the assistant spoke).
+// Known WebKit workarounds: tap a fresh MediaStream wrapping the track, or a
+// clone of the track. We arm strategy 0 and escalate whenever the assistant
+// is speaking but the reference still reads zero.
+function armReferenceTap(e, a, audioEl) {
+  const track = e.track || e.streams[0].getAudioTracks()[0];
+  const strategies = [
+    () => a.ctx.createMediaStreamSource(e.streams[0]),
+    () => a.ctx.createMediaStreamSource(new MediaStream([track])),
+    () => a.ctx.createMediaStreamSource(new MediaStream([track.clone()])),
+  ];
+  let idx = 0, src = null;
+  const arm = () => {
+    try { if (src) src.disconnect(); } catch {}
+    try {
+      src = strategies[idx]();
+      // ONE stream for both consumers: the tap feeds the worklet reference
+      // AND (via spkDest) the <audio> element the user hears — so the
+      // speaker signal IS the reference, no element-vs-tap drift.
+      src.connect(a.node, 0, 1);
+      src.connect(a.spkDest);
+      a.tapStrategy = idx;
+    } catch (err) { log('e', 'aec tap strategy ' + idx + ' failed: ' + err); }
+  };
+  arm();
+  track.addEventListener('unmute', arm, { once: true }); // re-arm once real audio starts
+  a.retap = () => { if (idx >= strategies.length - 1) return false; idx++; arm(); return true; };
+  // last resort: every strategy silent — play the raw track (uncancelled
+  // beats inaudible) and flag it
+  a.tapDead = () => {
+    audioEl.srcObject = e.streams[0];
+    aecLine.textContent = 'AEC: reference tap dead — raw playback, echo NOT cancelled';
+  };
+}
+let lastResponseAt = 0; // set on response.created — "the assistant is speaking"
 
 // ---- session --------------------------------------------------------------
 function log(cls, text) {
@@ -291,10 +338,15 @@ async function start() {
   const audioEl = new Audio();
   audioEl.autoplay = true;
   pc.ontrack = e => {
-    audioEl.srcObject = e.streams[0];      // speaker output AND the tap's required consumer
     if (aec) {
-      try { aec.ctx.createMediaStreamSource(e.streams[0]).connect(aec.node, 0, 1); }
-      catch (err) { log('e', 'aec reference tap failed: ' + err); }
+      // keep the raw stream consumed (desktop Chrome's tap needs a media
+      // element on it), but the audible path is tap -> spkDest -> audioEl
+      aec.rawEl = new Audio(); aec.rawEl.srcObject = e.streams[0]; aec.rawEl.muted = true;
+      aec.rawEl.play && aec.rawEl.play().catch(() => {});
+      audioEl.srcObject = aec.spkDest.stream;
+      armReferenceTap(e, aec, audioEl);
+    } else {
+      audioEl.srcObject = e.streams[0];
     }
   };
   pc.addTrack(sendTrack, sendStream);
@@ -346,7 +398,7 @@ async function handleEvent(ev) {
       break;
     }
     case 'input_audio_buffer.speech_started': setStatus('🟢 live — listening…'); break;
-    case 'response.created': setStatus('🟢 live — thinking/speaking…'); break;
+    case 'response.created': lastResponseAt = Date.now(); setStatus('🟢 live — thinking/speaking…'); break;
     case 'response.done': setStatus('🟢 live — talk to it'); break;
     case 'error': log('e', 'error: ' + JSON.stringify(ev.error)); break;
   }
@@ -356,7 +408,11 @@ function stop() {
   if (mic) mic.getTracks().forEach(t => t.stop());
   if (dc) dc.close();
   if (pc) pc.close();
-  if (aec) { try { aec.ctx.close(); } catch {} aec = null; }
+  if (aec) {
+    if (aec.rawEl) { aec.rawEl.pause(); aec.rawEl.srcObject = null; }
+    try { aec.ctx.close(); } catch {}
+    aec = null;
+  }
   aecLine.style.display = 'none';
   pc = dc = mic = null;
   btn.textContent = 'Start';

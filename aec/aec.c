@@ -33,6 +33,12 @@ __attribute__((used)) int aec_init(int frame, int filter_len, int rate) {
     int on = 1;
     speex_preprocess_ctl(den, SPEEX_PREPROCESS_SET_ECHO_STATE, st);
     speex_preprocess_ctl(den, SPEEX_PREPROCESS_SET_DENOISE, &on);
+    /* Crush residual echo far harder than the defaults (-40/-15): what the
+     * linear filter leaks is still speech-like enough to trip the remote VAD.
+     * echo-only regions get -60dB, double-talk regions -40dB. */
+    int sup = -60, sup_active = -40;
+    speex_preprocess_ctl(den, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS, &sup);
+    speex_preprocess_ctl(den, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS_ACTIVE, &sup_active);
   }
   return 1;
 }
