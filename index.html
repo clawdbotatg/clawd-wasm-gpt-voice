@@ -218,6 +218,8 @@ async function buildAecPath() {
   const node = new AudioWorkletNode(ctx, 'aec-processor', {
     numberOfInputs: 2, numberOfOutputs: 1, outputChannelCount: [1],
     processorOptions: { wasmBytes, tailMs: 200 } });
+  const telemetry = []; // 1/s worklet stats, POSTed to /report for debugging
+  let lastTelemetrySend = 0;
   node.port.onmessage = e => {
     const d = e.data;
     if (window.AecAlign && AecAlign.handle(node, d)) return; // delay tracker
@@ -225,6 +227,14 @@ async function buildAecPath() {
       aecLine.textContent = 'AEC: ' + (d.ready ? 'on' : 'loading') +
         (d.erleDb != null ? ' · cancelling ' + d.erleDb.toFixed(0) + ' dB' : ' · idle') +
         (d.farDelayMs ? ' · delay ' + d.farDelayMs + ' ms' : '');
+      telemetry.push({ t: Math.round(Date.now() / 1000), erle: d.erleDb == null ? null : +d.erleDb.toFixed(1),
+        delay: d.farDelayMs, farRms: d.farRms, farActive: d.farActiveFrames });
+      if (Date.now() - lastTelemetrySend > 10000) {
+        lastTelemetrySend = Date.now();
+        fetch('/report', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ts: new Date().toISOString(), ua: navigator.userAgent,
+            test: 'demo-aec-telemetry', data: { recent: telemetry.slice(-12) } }) }).catch(() => {});
+      }
     }
     if (d.type === 'error') { aecLine.textContent = 'AEC: FAILED — ' + d.error; log('e', 'aec worklet error: ' + d.error); }
   };
