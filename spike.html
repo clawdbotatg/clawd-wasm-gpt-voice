@@ -44,11 +44,13 @@
 
 <div class="panel">
   <h2>Test 2 — speaker echo, cancelled in WASM</h2>
-  <div class="sub"><b>Speaker at normal volume, no headphones, stay quiet.</b> Plays a looped
-  voice clip out of the speaker while recording the raw mic through the speex canceller
-  (~25s). PASS = echo attenuated ≥12 dB after convergence. Recordings below let you
-  hear raw vs cleaned.</div>
-  <button id="t2">Run test 2 (~25s)</button>
+  <div class="sub"><b>Speaker at normal volume, no headphones, phone on a table,
+  stay quiet and still the whole time.</b> Plays a looped voice clip out of the
+  speaker while recording the raw mic through the speex canceller — three
+  20s variants back-to-back (baseline / mic AGC off / AGC off + 400ms tail).
+  PASS = any variant ≥12 dB after convergence. Recordings let you hear raw vs
+  cleaned.</div>
+  <button id="t2">Run test 2 (~60s)</button>
   <div class="res" id="r2"></div>
   <div id="rec2"></div>
 </div>
@@ -229,74 +231,89 @@ function recorder(stream, label) {
   }; rec.stop(); }) };
 }
 
+const VARIANTS = [
+  { key: 'baseline',       agc: true,  tailMs: 200 },
+  { key: 'agc-off',        agc: false, tailMs: 200 },
+  { key: 'agc-off-tail400',agc: false, tailMs: 400 },
+];
+
+async function runVariant(ctx, wasmBytes, clip, v, onTick) {
+  const mic = await navigator.mediaDevices.getUserMedia({ audio: {
+    echoCancellation: false, noiseSuppression: true, autoGainControl: v.agc } });
+  const micTrack = mic.getAudioTracks()[0];
+  const micSettings = micTrack.getSettings ? micTrack.getSettings() : {};
+  const node = new AudioWorkletNode(ctx, 'aec-processor', {
+    numberOfInputs: 2, numberOfOutputs: 1, outputChannelCount: [1],
+    processorOptions: { wasmBytes, tailMs: v.tailMs } });
+  const stats = [];
+  let err = null;
+  node.port.onmessage = e => {
+    const d = e.data;
+    if (d.type === 'stats' && d.erleDb != null) { stats.push(d.erleDb); onTick(stats); }
+    if (d.type === 'error') err = d.error;
+  };
+  const micSrc = ctx.createMediaStreamSource(mic);
+  micSrc.connect(node, 0, 0);
+  const src = ctx.createBufferSource(); src.buffer = clip; src.loop = true;
+  src.connect(ctx.destination);                       // out the speaker
+  src.connect(node, 0, 1);                            // reference tap
+  const cleanDest = ctx.createMediaStreamDestination();
+  node.connect(cleanDest);
+  const rawDest = ctx.createMediaStreamDestination();
+  micSrc.connect(rawDest);
+  const recClean = recorder(cleanDest.stream, `🎧 ${v.key} — cleaned (what the model would hear)`);
+  const recRaw = recorder(rawDest.stream, `🎧 ${v.key} — raw mic (echo included)`);
+  src.start();
+  await sleep(20000);
+  src.stop();
+  await recClean.stop(); await recRaw.stop();
+  mic.getTracks().forEach(t => t.stop());
+  micSrc.disconnect(); node.disconnect();
+  const tail = stats.slice(-7);
+  const settled = tail.length ? tail.reduce((a, b) => a + b, 0) / tail.length : null;
+  return { key: v.key, tailMs: v.tailMs, agc: v.agc, erlePerSec: stats.map(s => +s.toFixed(1)),
+    settledDb: settled, peakDb: stats.length ? Math.max(...stats) : null,
+    error: err, micSettings };
+}
+
 $('t2').onclick = async () => {
   $('t2').disabled = true;
   const r2 = $('r2');
   $('rec2').innerHTML = '';
   const lines = ['RUNNING — mic + wasm…'];
   show(r2, lines);
-  let ctx, mic;
+  let ctx;
   try {
     ctx = new AC({ sampleRate: 48000 });
     await ctx.resume();
     const wasmBytes = await (await fetch('/aec/aec.wasm')).arrayBuffer();
     await ctx.audioWorklet.addModule('/aec/aec-worklet.js');
-    mic = await navigator.mediaDevices.getUserMedia({ audio: {
-      echoCancellation: false, noiseSuppression: true, autoGainControl: true } });
-    const micTrack = mic.getAudioTracks()[0];
-    const micSettings = micTrack.getSettings ? micTrack.getSettings() : {};
-
-    const node = new AudioWorkletNode(ctx, 'aec-processor', {
-      numberOfInputs: 2, numberOfOutputs: 1, outputChannelCount: [1],
-      processorOptions: { wasmBytes, tailMs: 200 } });
-    const stats = [];
-    node.port.onmessage = e => {
-      const d = e.data;
-      if (d.type === 'stats' && d.erleDb != null) {
-        stats.push(d.erleDb);
-        lines[0] = `RUNNING — ${stats.length}s  ERLE now: ${d.erleDb.toFixed(1)} dB`;
-        show(r2, lines);
-      }
-      if (d.type === 'error') { lines.push('worklet FAIL: ' + d.error); show(r2, lines); }
-    };
-
-    const micSrc = ctx.createMediaStreamSource(mic);
-    micSrc.connect(node, 0, 0);
-
     const clip = await voiceClip(ctx);
-    const src = ctx.createBufferSource(); src.buffer = clip; src.loop = true;
-    const spk = ctx.createGain(); spk.gain.value = 1.0;
-    src.connect(spk).connect(ctx.destination);          // out the speaker
-    src.connect(node, 0, 1);                            // reference tap
-    // cleaned + raw recordings for audition (never routed to the speaker)
-    const cleanDest = ctx.createMediaStreamDestination();
-    node.connect(cleanDest);
-    const rawDest = ctx.createMediaStreamDestination();
-    micSrc.connect(rawDest);
-    const recClean = recorder(cleanDest.stream, '🎧 cleaned mic (what the model would hear)');
-    const recRaw = recorder(rawDest.stream, '🎧 raw mic (echo included)');
-    src.start();
-
-    await sleep(25000);
-
-    src.stop();
-    await recClean.stop(); await recRaw.stop();
-    const tail = stats.slice(-8);
-    const settled = tail.length ? tail.reduce((a, b) => a + b, 0) / tail.length : null;
-    const peak = stats.length ? Math.max(...stats) : null;
-    const verdict = settled != null && settled >= 12 ? 'PASS' : 'FAIL';
+    const results = [];
+    for (const v of VARIANTS) {
+      const li = lines.length;
+      lines.push(`${v.key}: running…`);
+      const res = await runVariant(ctx, wasmBytes, clip, v, stats => {
+        lines[li] = `${v.key}: ${stats.length}/20s  ERLE now ${stats[stats.length - 1].toFixed(1)} dB`;
+        show(r2, lines);
+      });
+      results.push(res);
+      lines[li] = `${v.key}: settled ${res.settledDb == null ? 'n/a' : res.settledDb.toFixed(1) + ' dB'}` +
+        `  peak ${res.peakDb == null ? 'n/a' : res.peakDb.toFixed(1)}` +
+        `  [${res.erlePerSec.map(s => s.toFixed(0)).join(' ')}]` + (res.error ? '  ERR ' + res.error : '');
+      show(r2, lines);
+      await sleep(500);
+    }
+    const best = results.reduce((a, b) => ((b.settledDb ?? -99) > (a.settledDb ?? -99) ? b : a));
+    const verdict = (best.settledDb ?? -99) >= 12 ? 'PASS' : 'FAIL';
     lines[0] = 'done';
-    lines.push(`ERLE per second: ${stats.map(s => s.toFixed(0)).join(' ')}`);
-    lines.push(`settled (last 8s avg): ${settled == null ? 'n/a' : settled.toFixed(1) + ' dB'}  peak: ${peak == null ? 'n/a' : peak.toFixed(1) + ' dB'}`);
-    lines.push(`TEST 2: ${verdict} (threshold 12 dB) — now LISTEN to the two recordings below`);
+    lines.push(`TEST 2: ${verdict} — best: ${best.key} at ${best.settledDb == null ? 'n/a' : best.settledDb.toFixed(1)} dB (threshold 12) — now LISTEN to the recordings`);
     show(r2, lines);
-    await report('speaker-echo-cancel', { erlePerSec: stats, settledDb: settled, peakDb: peak, verdict,
-      sampleRate: ctx.sampleRate, micSettings });
+    await report('speaker-echo-cancel-matrix', { results, best: best.key, verdict, sampleRate: ctx.sampleRate });
   } catch (e) {
     lines.push('FAIL — ' + e); show(r2, lines);
-    await report('speaker-echo-cancel', { error: String(e), verdict: 'FAIL' });
+    await report('speaker-echo-cancel-matrix', { error: String(e), verdict: 'FAIL' });
   } finally {
-    if (mic) mic.getTracks().forEach(t => t.stop());
     if (ctx) ctx.close();
   }
   $('t2').disabled = false;
