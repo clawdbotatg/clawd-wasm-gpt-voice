@@ -235,7 +235,8 @@ async function buildAecPath() {
         if (!aec.retap()) { aec.tapDead && aec.tapDead(); aec.tapDead = null; }
       }
       telemetry.push({ t: Math.round(Date.now() / 1000), erle: d.erleDb == null ? null : +d.erleDb.toFixed(1),
-        delay: d.farDelayMs, farRms: d.farRms, farActive: d.farActiveFrames, tap: aec ? aec.tapStrategy : -1 });
+        delay: d.farDelayMs, farRms: d.farRms, farActive: d.farActiveFrames,
+        gated: d.gatedFrames, gate: d.gateOn ? 1 : 0, tap: aec ? aec.tapStrategy : -1 });
       if (Date.now() - lastTelemetrySend > 10000) {
         lastTelemetrySend = Date.now();
         fetch('/report', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -292,6 +293,16 @@ function armReferenceTap(e, a, audioEl) {
   };
 }
 let lastResponseAt = 0; // set on response.created — "the assistant is speaking"
+
+// echo gate control: gate the mic while assistant audio is (about to be)
+// playing, released 800ms after it stops (speaker latency + reverb tail)
+let gateOffTimer = null;
+function setGate(on) {
+  if (!aec || !aec.node) return;
+  if (gateOffTimer) { clearTimeout(gateOffTimer); gateOffTimer = null; }
+  if (on) aec.node.port.postMessage({ type: 'gate', on: true });
+  else gateOffTimer = setTimeout(() => { if (aec && aec.node) aec.node.port.postMessage({ type: 'gate', on: false }); }, 800);
+}
 
 // ---- session --------------------------------------------------------------
 function log(cls, text) {
@@ -398,8 +409,10 @@ async function handleEvent(ev) {
       break;
     }
     case 'input_audio_buffer.speech_started': setStatus('🟢 live — listening…'); break;
-    case 'response.created': lastResponseAt = Date.now(); setStatus('🟢 live — thinking/speaking…'); break;
-    case 'response.done': setStatus('🟢 live — talk to it'); break;
+    case 'output_audio_buffer.started': lastResponseAt = Date.now(); setGate(true); break;
+    case 'output_audio_buffer.stopped': setGate(false); break;
+    case 'response.created': lastResponseAt = Date.now(); setGate(true); setStatus('🟢 live — thinking/speaking…'); break;
+    case 'response.done': setGate(false); setStatus('🟢 live — talk to it'); break;
     case 'error': log('e', 'error: ' + JSON.stringify(ev.error)); break;
   }
 }

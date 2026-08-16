@@ -44,8 +44,18 @@ const AecAlign = {
     // shifted every 3s). Act only when the echo sits outside what the filter
     // can model: far beyond the tail start, or NON-CAUSAL (lag < 0, which no
     // causal filter can represent). Land it at +40ms for jitter margin.
+    // Require TWO consecutive agreeing estimates before shifting: a single
+    // bad correlation (double-talk contaminated) once shifted a live session
+    // 38→171ms and wrecked a converged filter.
     if (bestLag > 60 || bestLag < -10) {
-      node.port.postMessage({ type: 'farDelay', ms: bestLag - 40, score: +bestScore.toFixed(2) });
+      if (AecAlign._pending != null && Math.abs(AecAlign._pending - bestLag) <= 15) {
+        node.port.postMessage({ type: 'farDelay', ms: bestLag - 40, score: +bestScore.toFixed(2) });
+        AecAlign._pending = null;
+      } else {
+        AecAlign._pending = bestLag;
+      }
+    } else {
+      AecAlign._pending = null;
     }
     return true;
   },

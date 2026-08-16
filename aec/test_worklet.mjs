@@ -19,7 +19,7 @@ const wasmBytes = readFileSync(new URL('./aec.wasm', import.meta.url));
 const p = new PROC({ processorOptions: { wasmBytes, tailMs: 200 } });
 while (!p.ready) await new Promise(r => setTimeout(r, 10));
 
-const SEC = 16, total = SEC * RATE;
+const SEC = 16, total = (SEC + 8) * RATE; // +8s continues seamlessly into the gate phases
 const far = new Float64Array(total);
 let lp = 0; const a = Math.exp(-2 * Math.PI * 1000 / RATE);
 for (let i = 0; i < total; i++) {
@@ -32,7 +32,8 @@ const Q = 128;
 const nearBuf = new Float32Array(Q), farBuf = new Float32Array(Q), outBuf = new Float32Array(Q);
 let ein = 0, eout = 0, n = 0, sec = 0;
 const per = [];
-for (let off = 0; off + Q <= total; off += Q) {
+const MAIN = SEC * RATE;
+for (let off = 0; off + Q <= MAIN; off += Q) {
   for (let i = 0; i < Q; i++) {
     const k = off + i;
     const dl = k < 6 * RATE ? d1 : d2;
@@ -55,6 +56,31 @@ console.log('farDelay applied:', (p.farDelay / RATE * 1000).toFixed(0), 'ms;',
   'env msgs:', posted.filter(m => m.type === 'env').length);
 const preJump = per[5], postShift = per.slice(-3).reduce((x, y) => x + y, 0) / 3;
 console.log(`pre-jump: ${preJump.toFixed(1)} dB   settled after shift: ${postShift.toFixed(1)} dB`);
-const pass = preJump > 25 && postShift > 25 && p.farDelay === Math.round(0.08 * RATE);
+
+// echo gate: with the gate on, echo-only residual must be hard-zeroed while
+// genuine (loud) near speech still passes
+p.port.onmessage({ data: { type: 'gate', on: true } });
+let cursor = MAIN; // continue the timeline seamlessly — no splice discontinuity
+function runSeconds(seconds, speech) {
+  let eo = 0, cnt = 0;
+  const end = cursor + seconds * RATE;
+  for (; cursor + Q <= end; cursor += Q) {
+    for (let i = 0; i < Q; i++) {
+      const k = cursor + i;
+      nearBuf[i] = far[k - d2] * 0.5 + (speech ? (Math.random() * 2 - 1) * 0.3 : 0);
+      farBuf[i] = far[k];
+    }
+    p.process([[nearBuf], [farBuf]], [[outBuf]]);
+    for (let i = 0; i < Q; i++) eo += outBuf[i] ** 2;
+    cnt += Q;
+  }
+  return Math.sqrt(eo / cnt) * 32768;
+}
+const gatedRms = runSeconds(2, false);
+const speechRms = runSeconds(2, true);
+console.log(`gate: echo-only out rms ${gatedRms.toFixed(0)} (want <100), with speech ${speechRms.toFixed(0)} (want >1500)`);
+
+const pass = preJump > 25 && postShift > 25 && p.farDelay === Math.round(0.08 * RATE)
+  && gatedRms < 100 && speechRms > 1500;
 console.log(pass ? 'PASS' : 'FAIL');
 process.exit(pass ? 0 : 1);

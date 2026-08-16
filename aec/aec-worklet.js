@@ -46,10 +46,27 @@ class AecProcessor extends AudioWorkletProcessor {
     this.farDelay = 0;                    // samples
     this.MAXDELAY = Math.floor(sampleRate * 0.7);
 
+    // Echo gate — the nonlinear last stage. Linear AEC + suppression peaked
+    // at ~15-26dB on the iPhone and OpenAI's VAD STILL heard the residual
+    // (live sessions self-interrupted at those numbers). While the page says
+    // the assistant is speaking (gateOn) and the reference is active, output
+    // frames are hard-zeroed unless clearly louder than residual — real
+    // speech at the mic is ~25dB above it, so barge-in passes.
+    this.gateOn = false;
+    this.gateHold = 0;   // frames the gate stays open after loud input
+    this.farHold = 0;    // frames the reference counts as active after energy stops (reverb tail)
+    this.gatedFrames = 0;
+    this.openStreak = 0; // consecutive loud frames — speech sustains, residual spikes don't
+    this.GATE_OPEN_RMS = 3500;   // int16 rms that counts as loud (AGC'd speech sits well above)
+    this.GATE_OPEN_FRAMES = 3;   // 30ms sustained loud to open
+    this.GATE_HOLD_FRAMES = 40;  // 400ms open after real speech
+    this.FAR_HOLD_FRAMES = 30;   // 300ms of reverb tail counts as far-active
+
     this.port.onmessage = (e) => {
       const d = e.data || {};
       if (d.type === 'reset' && this.ready) this.E.aec_reset();
       if (d.type === 'bypass') this.bypass = !!d.on;
+      if (d.type === 'gate') this.gateOn = !!d.on;
       if (d.type === 'farDelay') {        // residual lag measured on the paired envelopes
         const delta = Math.round((d.ms || 0) * sampleRate / 1000);
         const target = Math.min(this.MAXDELAY, Math.max(0, this.farDelay + delta));
@@ -155,8 +172,22 @@ class AecProcessor extends AudioWorkletProcessor {
           this.outW++;
           en += h[this.nearPtr + i] ** 2; eo += o ** 2; ef += h[this.farPtr + i] ** 2;
         }
-        if (ef / F > 1000) { this.mNear += en; this.mOut += eo; this.mFrames++; } // far active
+        const farActiveFrame = ef / F > 1000;
+        if (farActiveFrame) { this.mNear += en; this.mOut += eo; this.mFrames++; }
         this.mFar += ef;
+        this.farHold = farActiveFrame ? this.FAR_HOLD_FRAMES : Math.max(0, this.farHold - 1);
+        if (this.gateOn && (farActiveFrame || this.farHold > 0)) {
+          const outRms = Math.sqrt(eo / F);
+          this.openStreak = outRms > this.GATE_OPEN_RMS ? this.openStreak + 1 : 0;
+          if (this.openStreak >= this.GATE_OPEN_FRAMES) this.gateHold = this.GATE_HOLD_FRAMES;
+          if (this.gateHold > 0) this.gateHold--;
+          else {
+            for (let k = this.outW - F; k < this.outW; k++) this.outQ[k % this.outQ.length] = 0;
+            this.gatedFrames++;
+          }
+        } else {
+          this.openStreak = 0;
+        }
       }
     } else {
       this.nearR = this.nearW; this.farR = this.farW; // drop while loading
@@ -180,7 +211,9 @@ class AecProcessor extends AudioWorkletProcessor {
         farActiveFrames: this.mFrames,
         farRms: Math.sqrt(this.mFar / Math.max(1, this.frame * this.mFrames)) | 0,
         farDelayMs: +(this.farDelay * 1000 / sampleRate).toFixed(1),
+        gatedFrames: this.gatedFrames, gateOn: this.gateOn,
       });
+      this.gatedFrames = 0;
       this.mNear = 0; this.mOut = 0; this.mFar = 0; this.mFrames = 0;
     }
     return true;
