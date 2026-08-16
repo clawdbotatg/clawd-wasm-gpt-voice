@@ -77,4 +77,10 @@ authoritative per-device spike + speaker-loop results.
 - 2026-08-16 desktop Chrome: test 0 PASS, test 1 PASS **only with** the
   element-consumer workaround (plain tap silent), test 2 not runnable on the
   build box (system CoreAudio wedged — `AudioQueueStart -66681`).
-- iPhone: pending real-device run over LAN HTTPS.
+- 2026-08-16 **iPhone (iOS 18.7 Safari): SPIKE PASSED** — test 0 PASS
+  (40.8dB), test 1 PASS with the *plain* tap (no workaround needed on iOS),
+  test 2 PASS (17.4dB settled / 33.3 peak) after fixing a worklet
+  ring-alignment bug the first run exposed (empty far quanta shifted the
+  echo alignment → ERLE sawtooth, 8.5dB FAIL; now zero-padded lockstep).
+- Real-OpenAI E2E from desktop (`tools/e2eprobe.mjs`): all green.
+- Remaining: the ten-minute speaker-loop conversation test on the live demo.
