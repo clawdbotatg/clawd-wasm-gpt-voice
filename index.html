@@ -210,10 +210,11 @@ async function buildAecPath() {
     fetch('/aec/aec.wasm').then(r => r.arrayBuffer()),
     ctx.audioWorklet.addModule('/aec/aec-worklet.js'),
   ]);
-  // AGC off: the iPhone spike matrix showed mic auto-gain riding the volume
-  // destabilizes the adaptive filter (2026-08-16); NS stays on.
+  // AGC stays ON: once the delay tracker fixed alignment, the iPhone matrix
+  // had AGC-on beating AGC-off 26.2 vs 19.7 dB settled (2026-08-16 22:05 run)
+  // — the earlier AGC suspicion was really misalignment. Only EC goes off.
   mic = await navigator.mediaDevices.getUserMedia({ audio: {
-    echoCancellation: false, noiseSuppression: true, autoGainControl: false } });
+    echoCancellation: false, noiseSuppression: true, autoGainControl: true } });
   const node = new AudioWorkletNode(ctx, 'aec-processor', {
     numberOfInputs: 2, numberOfOutputs: 1, outputChannelCount: [1],
     processorOptions: { wasmBytes, tailMs: 200 } });

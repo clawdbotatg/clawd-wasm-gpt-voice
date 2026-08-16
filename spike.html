@@ -266,7 +266,16 @@ async function runVariant(ctx, wasmBytes, clip, v, onTick) {
   const micSrc = ctx.createMediaStreamSource(mic);
   micSrc.connect(node, 0, 0);
   const src = ctx.createBufferSource(); src.buffer = clip; src.loop = true;
-  src.connect(ctx.destination);                       // out the speaker
+  // Speaker path goes through an <audio> element, NOT ctx.destination: with
+  // the mic capturing, iOS routes WebAudio output onto the quiet call-audio
+  // path ("spike is quiet at full volume"), while media elements keep the
+  // loud media route — which is also the demo's real path for the
+  // assistant's voice. Falls back to ctx.destination if play() is refused.
+  const spkDest = ctx.createMediaStreamDestination();
+  src.connect(spkDest);
+  const spkEl = new Audio();
+  spkEl.srcObject = spkDest.stream;
+  try { await spkEl.play(); } catch (e) { src.connect(ctx.destination); }
   src.connect(node, 0, 1);                            // reference tap
   const cleanDest = ctx.createMediaStreamDestination();
   node.connect(cleanDest);
@@ -277,6 +286,7 @@ async function runVariant(ctx, wasmBytes, clip, v, onTick) {
   src.start();
   await sleep(20000);
   src.stop();
+  spkEl.pause(); spkEl.srcObject = null;
   await recClean.stop(); await recRaw.stop();
   mic.getTracks().forEach(t => t.stop());
   micSrc.disconnect(); node.disconnect();
