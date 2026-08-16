@@ -78,11 +78,22 @@ class AecProcessor extends AudioWorkletProcessor {
       if (near && out) out.set(near);
       return true;
     }
-    if (near) this._push(this.nearQ, 'nearW', near);
-    // A far input that isn't connected (or a remote track that yields no
-    // callbacks) simply never advances farW; frames then use zero reference,
-    // which makes the canceller a no-op rather than a corrupter.
-    if (far) this._push(this.farQ, 'farW', far);
+    // near and far are one timeline: every quantum near advances, far MUST
+    // advance by the same amount, zero-padded when the far input is empty
+    // (unconnected yet, or an inactive-input hiccup — iOS Safari does this a
+    // lot). The first cut instead skipped far pushes and "resynced" later,
+    // which shifted the alignment on every hiccup and forced the adaptive
+    // filter to re-converge from scratch — measured on iPhone as ERLE
+    // sawtoothing 1→26→1 dB. Never advance one queue without the other.
+    if (near && near.length) {
+      this._push(this.nearQ, 'nearW', near);
+      if (far && far.length) {
+        this._push(this.farQ, 'farW', far);
+      } else {
+        if (!this._zeros || this._zeros.length !== near.length) this._zeros = new Float32Array(near.length);
+        this._push(this.farQ, 'farW', this._zeros);
+      }
+    }
 
     if (this.ready) {
       const F = this.frame, h = this.heap;
@@ -94,8 +105,7 @@ class AecProcessor extends AudioWorkletProcessor {
           h[this.farPtr + i] = Math.max(-32768, Math.min(32767, (f * 32767) | 0));
         }
         this.nearR += F;
-        if (this.farW - this.farR >= F) this.farR += F;
-        else this.farR = this.farW; // underrun: resync
+        this.farR += F; // lockstep with nearR by construction
         this.E.aec_process();
         let en = 0, eo = 0, ef = 0;
         for (let i = 0; i < F; i++) {
