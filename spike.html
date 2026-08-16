@@ -1,0 +1,304 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WASM AEC spike</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --line:#2d333b; --fg:#e6e8eb; --dim:#8b949e;
+          --ok:#4ade80; --bad:#f87171; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system,system-ui,sans-serif;
+         max-width:640px; margin:16px auto; padding:0 14px; }
+  h1 { font-size:19px; margin:0 0 2px; }
+  .sub { color:var(--dim); font-size:13px; margin-bottom:14px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:14px; }
+  .panel h2 { font-size:13px; margin:0 0 8px; }
+  button { font:inherit; font-size:17px; width:100%; padding:14px; border-radius:12px;
+           border:1px solid var(--line); background:#1c2128; color:var(--fg); cursor:pointer; margin-top:8px; }
+  button:disabled { opacity:.45; }
+  .res { font-family:ui-monospace,monospace; font-size:13px; white-space:pre-wrap; color:var(--dim); margin-top:10px; }
+  .PASS { color:var(--ok); font-weight:700; } .FAIL { color:var(--bad); font-weight:700; }
+  .RUN { color:var(--warn); }
+  audio { width:100%; margin-top:8px; }
+</style>
+
+<h1>🔬 WASM AEC spike</h1>
+<div class="sub" id="dev">…</div>
+
+<div class="panel">
+  <h2>Test 0 — synthetic pipeline (no mic, no speaker)</h2>
+  <div class="sub">Runs the real WASM canceller in the real AudioWorklet against a simulated
+  echo (voice clip through a 50ms delay at half volume). Validates the whole in-browser
+  pipeline without any acoustics — run this first on every device. ~15s, silent.</div>
+  <button id="t0">Run test 0 (~15s)</button>
+  <div class="res" id="r0"></div>
+</div>
+
+<div class="panel">
+  <h2>Test 1 — can WebAudio hear a remote WebRTC track?</h2>
+  <div class="sub">In-page loopback PeerConnection carrying a tone; taps the <i>remote</i>
+  track with MediaStreamAudioSourceNode, with and without the muted-&lt;audio&gt;-element
+  workaround. Silent tap on iOS = the whole approach is dead there. No mic needed.</div>
+  <button id="t1">Run test 1</button>
+  <div class="res" id="r1"></div>
+</div>
+
+<div class="panel">
+  <h2>Test 2 — speaker echo, cancelled in WASM</h2>
+  <div class="sub"><b>Speaker at normal volume, no headphones, stay quiet.</b> Plays a looped
+  voice clip out of the speaker while recording the raw mic through the speex canceller
+  (~25s). PASS = echo attenuated ≥12 dB after convergence. Recordings below let you
+  hear raw vs cleaned.</div>
+  <button id="t2">Run test 2 (~25s)</button>
+  <div class="res" id="r2"></div>
+  <div id="rec2"></div>
+</div>
+
+<div class="panel">
+  <h2>Report</h2>
+  <div class="res" id="rep">results auto-POST to /report on this server</div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const UA = navigator.userAgent;
+$('dev').textContent = UA;
+const AC = window.AudioContext || window.webkitAudioContext;
+
+function show(el, lines) { el.innerHTML = lines.map(l =>
+  l.replace(/\b(PASS|FAIL|RUNNING)\b/g, m => `<span class="${m==='RUNNING'?'RUN':m}">${m}</span>`)).join('<br>'); }
+
+async function report(test, data) {
+  const body = { ts: new Date().toISOString(), ua: UA, test, data };
+  try {
+    await fetch('/report', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    $('rep').textContent = 'reported: ' + test + ' @ ' + body.ts;
+  } catch (e) { $('rep').textContent = 'report failed: ' + e; }
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ---------- test 0: synthetic echo through the real worklet ---------------
+$('t0').onclick = async () => {
+  $('t0').disabled = true;
+  const r0 = $('r0');
+  const lines = ['RUNNING — loading wasm…'];
+  show(r0, lines);
+  let ctx;
+  try {
+    ctx = new AC({ sampleRate: 48000 });
+    await ctx.resume();
+    const wasmBytes = await (await fetch('/aec/aec.wasm')).arrayBuffer();
+    await ctx.audioWorklet.addModule('/aec/aec-worklet.js');
+    const node = new AudioWorkletNode(ctx, 'aec-processor', {
+      numberOfInputs: 2, numberOfOutputs: 1, outputChannelCount: [1],
+      processorOptions: { wasmBytes, tailMs: 200 } });
+    const stats = [];
+    node.port.onmessage = e => {
+      const d = e.data;
+      if (d.type === 'stats' && d.erleDb != null) {
+        stats.push(d.erleDb);
+        lines[0] = `RUNNING — ${stats.length}s  ERLE now: ${d.erleDb.toFixed(1)} dB`;
+        show(r0, lines);
+      }
+      if (d.type === 'error') { lines.push('worklet FAIL: ' + d.error); show(r0, lines); }
+    };
+    const clip = await voiceClip(ctx);
+    const src = ctx.createBufferSource(); src.buffer = clip; src.loop = true;
+    // simulated room: 50ms delay, -6dB
+    const delay = ctx.createDelay(1); delay.delayTime.value = 0.05;
+    const echoGain = ctx.createGain(); echoGain.gain.value = 0.5;
+    src.connect(delay).connect(echoGain).connect(node, 0, 0);  // "mic" = echo only
+    src.connect(node, 0, 1);                                   // reference
+    const sink = ctx.createMediaStreamDestination();           // pulls the graph
+    node.connect(sink);
+    src.start();
+    await sleep(15000);
+    src.stop();
+    const tail = stats.slice(-5);
+    const settled = tail.length ? tail.reduce((a, b) => a + b, 0) / tail.length : null;
+    const verdict = settled != null && settled >= 15 ? 'PASS' : 'FAIL';
+    lines[0] = 'done';
+    lines.push(`ERLE per second: ${stats.map(s => s.toFixed(0)).join(' ')}`);
+    lines.push(`settled (last 5s avg): ${settled == null ? 'n/a' : settled.toFixed(1) + ' dB'}`);
+    lines.push(`TEST 0: ${verdict} (threshold 15 dB)`);
+    show(r0, lines);
+    await report('synthetic-pipeline', { erlePerSec: stats, settledDb: settled, verdict, sampleRate: ctx.sampleRate });
+  } catch (e) {
+    lines.push('FAIL — ' + e); show(r0, lines);
+    await report('synthetic-pipeline', { error: String(e), verdict: 'FAIL' });
+  } finally { if (ctx) ctx.close(); }
+  $('t0').disabled = false;
+};
+
+// ---------- test 1: remote-track tap --------------------------------------
+async function measureTap(ctx, stream, withElement, seconds) {
+  let el = null;
+  if (withElement) { el = new Audio(); el.srcObject = stream; el.muted = true; try { await el.play(); } catch {} }
+  const src = ctx.createMediaStreamSource(stream);
+  const an = ctx.createAnalyser(); an.fftSize = 2048;
+  src.connect(an);
+  const buf = new Float32Array(an.fftSize);
+  let peakRms = 0, nonZero = 0, polls = 0;
+  const t0 = performance.now();
+  while (performance.now() - t0 < seconds * 1000) {
+    an.getFloatTimeDomainData(buf);
+    let s = 0; for (let i = 0; i < buf.length; i++) { s += buf[i] * buf[i]; if (buf[i] !== 0) nonZero++; }
+    peakRms = Math.max(peakRms, Math.sqrt(s / buf.length));
+    polls++;
+    await sleep(100);
+  }
+  src.disconnect();
+  if (el) { el.pause(); el.srcObject = null; }
+  return { peakRms: +peakRms.toFixed(5), nonZeroSamples: nonZero, polls };
+}
+
+$('t1').onclick = async () => {
+  $('t1').disabled = true;
+  const r1 = $('r1');
+  const lines = ['RUNNING — building loopback call…'];
+  show(r1, lines);
+  try {
+    const ctx = new AC({ sampleRate: 48000 });
+    await ctx.resume();
+    // synth source: AM tone into a MediaStreamDestination
+    const osc = ctx.createOscillator(); osc.frequency.value = 440;
+    const g = ctx.createGain(); g.gain.value = 0.5;
+    const dest = ctx.createMediaStreamDestination();
+    osc.connect(g).connect(dest); osc.start();
+    // loopback pc pair
+    const pc1 = new RTCPeerConnection(), pc2 = new RTCPeerConnection();
+    pc1.onicecandidate = e => e.candidate && pc2.addIceCandidate(e.candidate);
+    pc2.onicecandidate = e => e.candidate && pc1.addIceCandidate(e.candidate);
+    dest.stream.getTracks().forEach(t => pc1.addTrack(t, dest.stream));
+    const remote = new Promise(res => { pc2.ontrack = e => res(e.streams[0]); });
+    await pc1.setLocalDescription(await pc1.createOffer());
+    await pc2.setRemoteDescription(pc1.localDescription);
+    await pc2.setLocalDescription(await pc2.createAnswer());
+    await pc1.setRemoteDescription(pc2.localDescription);
+    const rstream = await remote;
+    lines[0] = 'loopback call up; tapping remote track…';
+    show(r1, lines);
+    await sleep(500);
+    const plain = await measureTap(ctx, rstream, false, 3);
+    lines.push(`plain tap:        peakRMS=${plain.peakRms} ${plain.peakRms > 0.01 ? 'PASS' : 'FAIL'}`);
+    show(r1, lines);
+    const withEl = await measureTap(ctx, rstream, true, 3);
+    lines.push(`muted-element tap: peakRMS=${withEl.peakRms} ${withEl.peakRms > 0.01 ? 'PASS' : 'FAIL'}`);
+    const verdict = (plain.peakRms > 0.01 || withEl.peakRms > 0.01) ? 'PASS' : 'FAIL';
+    lines.push(`TEST 1: ${verdict}` + (verdict === 'PASS' && plain.peakRms <= 0.01 ? ' (needs muted-element workaround)' : ''));
+    show(r1, lines);
+    pc1.close(); pc2.close(); osc.stop(); ctx.close();
+    await report('remote-track-tap', { plain, withElement: withEl, verdict, sampleRate: ctx.sampleRate });
+  } catch (e) {
+    lines.push('FAIL — ' + e); show(r1, lines);
+    await report('remote-track-tap', { error: String(e), verdict: 'FAIL' });
+  }
+  $('t1').disabled = false;
+};
+
+// ---------- test 2: acoustic echo through the canceller -------------------
+async function voiceClip(ctx) {
+  try {
+    const r = await fetch('/speak', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ voice: 'marin' }) });
+    if (r.ok) return await ctx.decodeAudioData(await r.arrayBuffer());
+  } catch {}
+  // fallback: 4s speech-shaped noise
+  const rate = ctx.sampleRate, buf = ctx.createBuffer(1, rate * 4, rate), d = buf.getChannelData(0);
+  let lp = 0; const a = Math.exp(-2 * Math.PI * 1000 / rate);
+  for (let i = 0; i < d.length; i++) {
+    const t = i / rate;
+    lp = a * lp + (1 - a) * (Math.random() * 2 - 1) * 3;
+    d[i] = Math.max(-0.9, Math.min(0.9, lp * (0.4 + 0.6 * Math.max(0, Math.sin(2 * Math.PI * 3 * t)))));
+  }
+  return buf;
+}
+
+function recorder(stream, label) {
+  const mime = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4';
+  const rec = new MediaRecorder(stream, { mimeType: mime });
+  const chunks = [];
+  rec.ondataavailable = e => chunks.push(e.data);
+  rec.start();
+  return { stop: () => new Promise(res => { rec.onstop = () => {
+    const url = URL.createObjectURL(new Blob(chunks, { type: mime }));
+    const div = document.createElement('div');
+    div.innerHTML = `<div class="res">${label}</div><audio controls src="${url}"></audio>`;
+    $('rec2').appendChild(div);
+    res();
+  }; rec.stop(); }) };
+}
+
+$('t2').onclick = async () => {
+  $('t2').disabled = true;
+  const r2 = $('r2');
+  $('rec2').innerHTML = '';
+  const lines = ['RUNNING — mic + wasm…'];
+  show(r2, lines);
+  let ctx, mic;
+  try {
+    ctx = new AC({ sampleRate: 48000 });
+    await ctx.resume();
+    const wasmBytes = await (await fetch('/aec/aec.wasm')).arrayBuffer();
+    await ctx.audioWorklet.addModule('/aec/aec-worklet.js');
+    mic = await navigator.mediaDevices.getUserMedia({ audio: {
+      echoCancellation: false, noiseSuppression: true, autoGainControl: true } });
+    const micTrack = mic.getAudioTracks()[0];
+    const micSettings = micTrack.getSettings ? micTrack.getSettings() : {};
+
+    const node = new AudioWorkletNode(ctx, 'aec-processor', {
+      numberOfInputs: 2, numberOfOutputs: 1, outputChannelCount: [1],
+      processorOptions: { wasmBytes, tailMs: 200 } });
+    const stats = [];
+    node.port.onmessage = e => {
+      const d = e.data;
+      if (d.type === 'stats' && d.erleDb != null) {
+        stats.push(d.erleDb);
+        lines[0] = `RUNNING — ${stats.length}s  ERLE now: ${d.erleDb.toFixed(1)} dB`;
+        show(r2, lines);
+      }
+      if (d.type === 'error') { lines.push('worklet FAIL: ' + d.error); show(r2, lines); }
+    };
+
+    const micSrc = ctx.createMediaStreamSource(mic);
+    micSrc.connect(node, 0, 0);
+
+    const clip = await voiceClip(ctx);
+    const src = ctx.createBufferSource(); src.buffer = clip; src.loop = true;
+    const spk = ctx.createGain(); spk.gain.value = 1.0;
+    src.connect(spk).connect(ctx.destination);          // out the speaker
+    src.connect(node, 0, 1);                            // reference tap
+    // cleaned + raw recordings for audition (never routed to the speaker)
+    const cleanDest = ctx.createMediaStreamDestination();
+    node.connect(cleanDest);
+    const rawDest = ctx.createMediaStreamDestination();
+    micSrc.connect(rawDest);
+    const recClean = recorder(cleanDest.stream, '🎧 cleaned mic (what the model would hear)');
+    const recRaw = recorder(rawDest.stream, '🎧 raw mic (echo included)');
+    src.start();
+
+    await sleep(25000);
+
+    src.stop();
+    await recClean.stop(); await recRaw.stop();
+    const tail = stats.slice(-8);
+    const settled = tail.length ? tail.reduce((a, b) => a + b, 0) / tail.length : null;
+    const peak = stats.length ? Math.max(...stats) : null;
+    const verdict = settled != null && settled >= 12 ? 'PASS' : 'FAIL';
+    lines[0] = 'done';
+    lines.push(`ERLE per second: ${stats.map(s => s.toFixed(0)).join(' ')}`);
+    lines.push(`settled (last 8s avg): ${settled == null ? 'n/a' : settled.toFixed(1) + ' dB'}  peak: ${peak == null ? 'n/a' : peak.toFixed(1) + ' dB'}`);
+    lines.push(`TEST 2: ${verdict} (threshold 12 dB) — now LISTEN to the two recordings below`);
+    show(r2, lines);
+    await report('speaker-echo-cancel', { erlePerSec: stats, settledDb: settled, peakDb: peak, verdict,
+      sampleRate: ctx.sampleRate, micSettings });
+  } catch (e) {
+    lines.push('FAIL — ' + e); show(r2, lines);
+    await report('speaker-echo-cancel', { error: String(e), verdict: 'FAIL' });
+  } finally {
+    if (mic) mic.getTracks().forEach(t => t.stop());
+    if (ctx) ctx.close();
+  }
+  $('t2').disabled = false;
+};
+</script>

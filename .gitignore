@@ -1,0 +1,7 @@
+.env
+.cert/
+spike-results.jsonl
+aec/speexdsp/
+__pycache__/
+serve.log
+tools/node_modules
