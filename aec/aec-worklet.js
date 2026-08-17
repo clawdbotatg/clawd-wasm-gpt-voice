@@ -53,6 +53,7 @@ class AecProcessor extends AudioWorkletProcessor {
     // frames are hard-zeroed unless clearly louder than residual — real
     // speech at the mic is ~25dB above it, so barge-in passes.
     this.gateOn = false;
+    this.speaking = false;
     this.gateHold = 0;   // frames the gate stays open after loud input
     this.farHold = 0;    // frames the reference counts as active after energy stops (reverb tail)
     this.gatedFrames = 0;
@@ -67,6 +68,7 @@ class AecProcessor extends AudioWorkletProcessor {
       if (d.type === 'reset' && this.ready) this.E.aec_reset();
       if (d.type === 'bypass') this.bypass = !!d.on;
       if (d.type === 'gate') this.gateOn = !!d.on;
+      if (d.type === 'speaking') this.speaking = !!d.on; // playback-accurate page signal — gates even if the tap dies
       if (d.type === 'farDelay') {        // residual lag measured on the paired envelopes
         const delta = Math.round((d.ms || 0) * sampleRate / 1000);
         const target = Math.min(this.MAXDELAY, Math.max(0, this.farDelay + delta));
@@ -176,7 +178,7 @@ class AecProcessor extends AudioWorkletProcessor {
         if (farActiveFrame) { this.mNear += en; this.mOut += eo; this.mFrames++; }
         this.mFar += ef;
         this.farHold = farActiveFrame ? this.FAR_HOLD_FRAMES : Math.max(0, this.farHold - 1);
-        if (this.gateOn && (farActiveFrame || this.farHold > 0)) {
+        if (this.gateOn && (farActiveFrame || this.farHold > 0 || this.speaking)) {
           const outRms = Math.sqrt(eo / F);
           this.openStreak = outRms > this.GATE_OPEN_RMS ? this.openStreak + 1 : 0;
           if (this.openStreak >= this.GATE_OPEN_FRAMES) this.gateHold = this.GATE_HOLD_FRAMES;

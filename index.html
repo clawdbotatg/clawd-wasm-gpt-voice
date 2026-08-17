@@ -227,9 +227,11 @@ async function buildAecPath() {
       aecLine.textContent = 'AEC: ' + (d.ready ? 'on' : 'loading') +
         (d.erleDb != null ? ' · cancelling ' + d.erleDb.toFixed(0) + ' dB' : ' · idle') +
         (d.farDelayMs ? ' · delay ' + d.farDelayMs + ' ms' : '');
-      // assistant audibly speaking but reference silent -> tap strategy is
-      // dead on this browser; escalate (and finally fall back to raw playback)
-      if (aec && aec.retap && d.ready && !d.farRms && Date.now() - lastResponseAt < 8000 &&
+      // audio actually PLAYING but reference silent -> tap strategy is dead
+      // on this browser; escalate (and finally fall back to raw playback).
+      // Gated on aec.speaking, not a response timestamp — the timestamp
+      // version burned strategies during normal turn-taking silences.
+      if (aec && aec.retap && d.ready && !d.farRms && aec.speaking &&
           Date.now() - (aec.lastRetapAt || 0) > 4000) {
         aec.lastRetapAt = Date.now();
         if (!aec.retap()) { aec.tapDead && aec.tapDead(); aec.tapDead = null; }
@@ -250,6 +252,7 @@ async function buildAecPath() {
   const cleanDest = ctx.createMediaStreamDestination();
   node.connect(cleanDest);
   const spkDest = ctx.createMediaStreamDestination(); // what the user hears (fed by the tap)
+  node.port.postMessage({ type: 'gate', on: true });  // echo gate armed for the whole session
   aecLine.style.display = 'block';
   aecLine.textContent = 'AEC: on';
   return { ctx, node, spkDest, cleanTrack: cleanDest.stream.getAudioTracks()[0] };
@@ -294,15 +297,11 @@ function armReferenceTap(e, a, audioEl) {
 }
 let lastResponseAt = 0; // set on response.created — "the assistant is speaking"
 
-// echo gate control: gate the mic while assistant audio is (about to be)
-// playing, released 800ms after it stops (speaker latency + reverb tail)
-let gateOffTimer = null;
-function setGate(on) {
-  if (!aec || !aec.node) return;
-  if (gateOffTimer) { clearTimeout(gateOffTimer); gateOffTimer = null; }
-  if (on) aec.node.port.postMessage({ type: 'gate', on: true });
-  else gateOffTimer = setTimeout(() => { if (aec && aec.node) aec.node.port.postMessage({ type: 'gate', on: false }); }, 800);
-}
+// The echo gate is enabled once per session and self-times off the REFERENCE
+// signal (far-active + reverb hold) inside the worklet. It was first driven
+// by response events — but response.done fires when generation ends, seconds
+// before playback does, so the tail of every answer went unprotected
+// (observed live: farRms 2600 with the gate already released).
 
 // ---- session --------------------------------------------------------------
 function log(cls, text) {
@@ -409,10 +408,15 @@ async function handleEvent(ev) {
       break;
     }
     case 'input_audio_buffer.speech_started': setStatus('🟢 live — listening…'); break;
-    case 'output_audio_buffer.started': lastResponseAt = Date.now(); setGate(true); break;
-    case 'output_audio_buffer.stopped': setGate(false); break;
-    case 'response.created': lastResponseAt = Date.now(); setGate(true); setStatus('🟢 live — thinking/speaking…'); break;
-    case 'response.done': setGate(false); setStatus('🟢 live — talk to it'); break;
+    case 'output_audio_buffer.started':
+      lastResponseAt = Date.now();
+      if (aec) { aec.speaking = true; aec.node.port.postMessage({ type: 'speaking', on: true }); }
+      break;
+    case 'output_audio_buffer.stopped':
+      if (aec) { aec.speaking = false; aec.node.port.postMessage({ type: 'speaking', on: false }); }
+      break;
+    case 'response.created': lastResponseAt = Date.now(); setStatus('🟢 live — thinking/speaking…'); break;
+    case 'response.done': setStatus('🟢 live — talk to it'); break;
     case 'error': log('e', 'error: ' + JSON.stringify(ev.error)); break;
   }
 }
