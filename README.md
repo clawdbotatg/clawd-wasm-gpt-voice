@@ -1,5 +1,15 @@
 # clawd-wasm-gpt-voice — full-duplex browser voice via WASM echo cancellation
 
+> ## ❌ FINAL: FAILED the acceptance test (2026-08-17)
+> Every component works (spike passed on iPhone: wasm AEC, remote-track tap,
+> delay tracking, 26dB cancellation) — but live conversation on an iPhone
+> speaker self-interrupted at that suppression level, and the echo-gate that
+> stopped it made turn-taking feel gated and unnatural. Conclusion: browser
+> WASM AEC cannot deliver the natural GPT-app speaker experience on iOS;
+> OS-level echo cancellation (native iOS/macOS shells — demos 1 and 2) is
+> the path. Kept as a flagged experiment: works with headphones and on
+> desktop. Full write-up: clawd-harness `docs/voice/BUILD-WASM-AEC.md`.
+
 Fork of [clawdbotatg/gpt-voice](https://github.com/clawdbotatg/gpt-voice)
 (the verified-working `gpt-realtime` WebRTC demo — see `UPSTREAM-README.md` /
 `INTEGRATION.md`) that changes ONLY the audio path: instead of trusting the
